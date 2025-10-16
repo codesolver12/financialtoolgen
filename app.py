@@ -15,7 +15,6 @@ import random
 import streamlit as st
 from jinja2 import Template
 import pandas as pd
-import matplotlib.pyplot as plt
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
