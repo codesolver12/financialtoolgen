@@ -7,7 +7,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 from jinja2 import Template
 from io import BytesIO
 from datetime import datetime
@@ -19,7 +19,6 @@ from docx.shared import Pt
 # ==============
 # Utils & Models
 # ==============
-
 GLOSSARY = {
     "EBITDA": "Earnings before interest, taxes, depreciation, and amortization.",
     "DSCR": "Debt Service Coverage Ratio = Cash Available for Debt Service / (Interest + Principal).",
@@ -32,11 +31,17 @@ class Snapshot:
     metrics: Dict[str, Any]
     assumptions_used: Dict[str, Any]
 
+# ------------- helpers -------------
+def fmt_currency(n) -> str:
+    """Format a number as integer with thousand separators."""
+    try:
+        return f"{int(round(float(n))):,}"
+    except Exception:
+        return "0"
+
 # ==============
 # IRR Calculation
 # ==============
-# We avoid numpy to keep this app light and portable.
-# Robust IRR via bisection + sanity checks.
 def npv(rate: float, cashflows: List[float]) -> float:
     total = 0.0
     for i, cf in enumerate(cashflows):
@@ -44,13 +49,10 @@ def npv(rate: float, cashflows: List[float]) -> float:
     return total
 
 def irr(cashflows: List[float], low=-0.9999, high=1.0, tol=1e-7, max_iter=200) -> float:
-    """Bisection-based IRR (handles tricky cashflows better than naive Newton).
-    Returns a float rate (e.g., 0.18 for 18%). If it fails, returns 0.0."""
-    # quick sanity: need at least one sign change in discounted cashflows space
+    """Bisection IRR. Returns decimal rate (0.18 ⇒ 18%)."""
     f_low = npv(low, cashflows)
     f_high = npv(high, cashflows)
     if f_low * f_high > 0:
-        # Try to expand the interval a few times
         for _ in range(10):
             high *= 2.0
             f_high = npv(high, cashflows)
@@ -77,21 +79,19 @@ def irr(cashflows: List[float], low=-0.9999, high=1.0, tol=1e-7, max_iter=200) -
 # Deterministic Financials
 # ======================
 def run_calculations(ass: Dict[str, Any]) -> Snapshot:
-    # Inputs with sensible defaults
     capex_total     = float(ass.get("capex_total",     1_200_000_000))  # ₹
     years           = int(  ass.get("years",           10))
     year1_revenue   = float(ass.get("year1_revenue",   450_000_000))
-    revenue_growth  = float(ass.get("revenue_growth",  0.08))           # 8%
-    ebitda_margin   = float(ass.get("ebitda_margin",   0.22))           # 22%
+    revenue_growth  = float(ass.get("revenue_growth",  0.08))
+    ebitda_margin   = float(ass.get("ebitda_margin",   0.22))
     debt_amount     = float(ass.get("debt_amount",     capex_total*0.6))
-    interest_rate   = float(ass.get("interest_rate",   0.11))           # 11%
+    interest_rate   = float(ass.get("interest_rate",   0.11))
     tenor_years     = int(  ass.get("tenor_years",     7))
 
-    # Revenue & EBITDA projections (simple, extend later)
     revenues = [year1_revenue * ((1.0 + revenue_growth) ** i) for i in range(years)]
     ebitdas  = [r * ebitda_margin for r in revenues]
 
-    # Debt schedule (flat principal)
+    # simple flat principal loan
     principal_annual = debt_amount / tenor_years if tenor_years else 0.0
     outstanding = debt_amount
     dscr_list: List[float] = []
@@ -100,25 +100,25 @@ def run_calculations(ass: Dict[str, Any]) -> Snapshot:
         interest_y   = outstanding * interest_rate if outstanding > 0 else 0.0
         principal_y  = principal_annual if y < tenor_years else 0.0
         debt_service = interest_y + principal_y
-        cash_avail   = ebitdas[y]  # crude proxy (improve later with WC, taxes, etc.)
+        cash_avail   = ebitdas[y]
         dscr_list.append((cash_avail / debt_service) if debt_service > 0 else float("inf"))
         if y < tenor_years:
             outstanding -= principal_annual
 
-    # Project cashflows (very simplified): -CAPEX at t0, then EBITDA each year
-    cashflows = [-capex_total] + ebitdas
+    # Project cashflows: -CAPEX at t0, then EBITDA each year
+    cashflows   = [-capex_total] + ebitdas
     project_irr = irr(cashflows)
 
-    # Payback year index (first year cum cashflows >= 0)
+    # Payback year index
     cum, payback_year = 0.0, None
     for i, cf in enumerate(cashflows):
         cum += cf
         if cum >= 0 and payback_year is None:
             payback_year = i
 
-    snap = Snapshot(
-        id = datetime.now().strftime("%Y%m%d%H%M%S"),
-        metrics = {
+    return Snapshot(
+        id=datetime.now().strftime("%Y%m%d%H%M%S"),
+        metrics={
             "revenue_yearly": revenues,
             "ebitda_yearly": ebitdas,
             "ebitda_margin": ebitda_margin,
@@ -127,9 +127,8 @@ def run_calculations(ass: Dict[str, Any]) -> Snapshot:
             "dscr_avg": sum(dscr_list)/len(dscr_list),
             "payback_year": payback_year
         },
-        assumptions_used = ass
+        assumptions_used=ass
     )
-    return snap
 
 # =====================
 # Verification Gateways
@@ -148,10 +147,10 @@ def verify_snapshot(snapshot: Snapshot, combined_text: str) -> List[str]:
     if dscr_min != float('inf') and dscr_min < 0.8:
         issues.append(f"DSCR minimum too low: {dscr_min:.2f}")
 
-    # Glossary enforcement (ensures core terms are present in the text)
     for k in ["EBITDA", "DSCR", "IRR"]:
         if k not in combined_text:
             issues.append(f"Term '{k}' not present where expected in narrative.")
+
     return issues
 
 # =================
@@ -161,7 +160,8 @@ def render(tpl: str, ctx: Dict[str, Any]) -> str:
     return Template(tpl).render(**ctx)
 
 def draft_all_sections(prompt: str, assumptions: Dict[str, Any], metrics: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
-    ctx = {"prompt": prompt, "ass": assumptions, "m": metrics}
+    # pass a safe formatter into Jinja context
+    ctx = {"prompt": prompt, "ass": assumptions, "m": metrics, "fmt": fmt_currency}
     S: Dict[str, Dict[str, str]] = {}
 
     def sec(i: int, title: str, body_tpl: str):
@@ -221,7 +221,7 @@ def draft_all_sections(prompt: str, assumptions: Dict[str, Any], metrics: Dict[s
 **5.4 Compliance & Approvals:** Factory license, FSSAI, PCB consents, boiler, electrical, fire & safety.
 """)
 
-    sec(6, "Project Costs (CAPEX)", f"""
+    sec(6, "Project Costs (CAPEX)", """
 **6.1 Land & Site Development:** (TBD)
 
 **6.2 Civil & Building Works:** (TBD)
@@ -234,7 +234,7 @@ def draft_all_sections(prompt: str, assumptions: Dict[str, Any], metrics: Dict[s
 
 **6.6 Pre-operative Expenses & Contingencies:** Engineering, commissioning, contingency.
 
-**6.7 Total CAPEX:** **₹{{ '{{:,}}'.format(ass.get('capex_total',0)) }}**
+**6.7 Total CAPEX:** **₹{{ fmt(ass.get('capex_total',0)) }}**
 """)
 
     sec(7, "Operating Costs (OPEX)", """
@@ -256,11 +256,11 @@ def draft_all_sections(prompt: str, assumptions: Dict[str, Any], metrics: Dict[s
     sec(8, "Revenue & Financial Analysis", """
 **8.1 Revenue Streams (Protein, Starch, Fiber, Feed):** Mix balanced for domestic + export.
 
-**8.2 Annual Projections & EBITDA:** EBITDA margin ~ **{{ (m.get('ebitda_margin',0.0)*100)|round(1) }}%**; Yr-1 EBITDA ≈ **₹{{ '{:,}'.format(int((m.get('ebitda_yearly',[0])[0] or 0))) }}**.
+**8.2 Annual Projections & EBITDA:** EBITDA margin ~ **{{ (m.get('ebitda_margin',0.0)*100)|round(1) }}%**; Yr-1 EBITDA ≈ **₹{{ fmt( (m.get('ebitda_yearly',[0])[0] or 0) ) }}**.
 
 **8.3 IRR, DSCR, Payback Analysis:** IRR ~ **{{ (m.get('irr_project',0.0)*100)|round(2) }}%**, Min DSCR **{{ m.get('dscr_min')|round(2) }}**, Payback index **{{ m.get('payback_year') }}**.
 
-**8.1 Financing Plan:** Assumed debt-equity with tenor **{{ ass.get('tenor_years',7) }}** years.
+**8.1 Financing Plan:** Assumed debt–equity with tenor **{{ ass.get('tenor_years',7) }}** years.
 
 **8.2 Sensitivity Analysis (Indicative):** ±10–20% on yields, ASP, energy tariffs, load factor.
 """)
@@ -319,7 +319,6 @@ def build_docx(sections: Dict[str, Dict[str, str]]) -> bytes:
     style = doc.styles["Normal"]
     style.font.name = "Calibri"
     style.font.size = Pt(11)
-
     doc.add_heading("Business Plan Report", level=0)
     for i in range(1, 13):
         sid = str(i)
@@ -329,7 +328,6 @@ def build_docx(sections: Dict[str, Dict[str, str]]) -> bytes:
         content = sec.get("markdown", "")
         for para in content.split("\n\n"):
             doc.add_paragraph(para.replace("\n", " "))
-
     bio = BytesIO()
     doc.save(bio)
     bio.seek(0)
@@ -353,10 +351,10 @@ with st.expander("How it works", expanded=False):
 st.sidebar.header("Assumptions")
 capex_total    = st.sidebar.number_input("Total CAPEX (₹)", value=1_200_000_000, min_value=0, step=10_000_000)
 years          = st.sidebar.number_input("Projection Years", value=10, min_value=1, max_value=30, step=1)
-year1_revenue  = st.sidebar.number_input("Year-1 Revenue (₹)", value=450_000_000, min_value=0, step=10_000_0)
+year1_revenue  = st.sidebar.number_input("Year-1 Revenue (₹)", value=450_000_000, min_value=0, step=100_000)
 revenue_growth = st.sidebar.number_input("Revenue Growth (decimal)", value=0.08, min_value=-0.5, max_value=1.0, step=0.01, format="%.2f")
 ebitda_margin  = st.sidebar.number_input("EBITDA Margin (decimal)", value=0.22, min_value=0.0, max_value=1.0, step=0.01, format="%.2f")
-debt_amount    = st.sidebar.number_input("Debt Amount (₹)", value=int(1_200_000_000*0.6), min_value=0, step=10_000_0)
+debt_amount    = st.sidebar.number_input("Debt Amount (₹)", value=int(1_200_000_000*0.6), min_value=0, step=100_000)
 interest_rate  = st.sidebar.number_input("Interest Rate (decimal)", value=0.11, min_value=0.0, max_value=1.0, step=0.01, format="%.2f")
 tenor_years    = st.sidebar.number_input("Debt Tenor (years)", value=7, min_value=0, max_value=30, step=1)
 
@@ -381,7 +379,7 @@ if st.button("Generate Plan", type="primary"):
     # 1) Calculations
     snap = run_calculations(assumptions)
 
-    # 2) Draft all sections (templated now; swap with real LLM later)
+    # 2) Draft all sections
     sections = draft_all_sections(prompt, assumptions, snap.metrics)
 
     # 3) Verification
@@ -428,5 +426,4 @@ if st.button("Generate Plan", type="primary"):
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
 
-# (Optional) Footer
 st.caption("Deterministic financials; narratives templated. Swap drafting with your LLM when ready (grounded on calc snapshot).")
